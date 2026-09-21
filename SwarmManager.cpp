@@ -6,6 +6,7 @@
 #include "Components/BoxComponent.h"
 #include "Math/UnrealMathUtility.h"
 #include "Kismet/GameplayStatics.h"
+#include "Async/ParallelFor.h"
 #include "Kismet/KismetMathLibrary.h"
 
 // Sets default values
@@ -19,6 +20,14 @@ ASwarmManager::ASwarmManager()
 
 	//Creates the Instanced Static Mesh
 	EnemyInstancedMesh = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("InstancedMeshComp"));
+
+	//Shadows are expensive
+	EnemyInstancedMesh->SetCastShadow(false);
+	EnemyInstancedMesh->bCastDynamicShadow = false;
+
+	//We are using avoidance-based steering, we don't need collision
+	EnemyInstancedMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	EnemyInstancedMesh->SetGenerateOverlapEvents(false);
 }
 
 //Helper function that does a line trace from the top of the Manager's volume to the bottom
@@ -81,12 +90,14 @@ void ASwarmManager::BeginPlay()
 		true
 	);
 
-	//Pre-allocate the rat data arrays, 3000 is hardcoded, in the future this should be a variable
-	RatData.SetNum(3000);
-	RatRenderData.SetNum(3000);
+	BoundingBox->UpdateBounds();
 
-	//Spawn all Instanced Static Meshes. Again, 3000 is hardcoded for now
-	for (int32 i = 0; i < 3000; i++)
+	//Pre-allocate the rat data arrays, 5000 is hardcoded, in the future this should be a variable
+	RatData.SetNum(5000);
+	RatRenderData.SetNum(5000);
+
+	//Spawn all Instanced Static Meshes. Again, 5000 is hardcoded for now
+	for (int32 i = 0; i < 5000; i++)
 	{
 		FVector BaseMeshBounds = EnemyInstancedMesh->GetStaticMesh()->GetBounds().BoxExtent;
 
@@ -122,7 +133,11 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 	//Calculate how many points we need
 	width = BoundingBox->GetScaledBoxExtent().X;
 	depth = BoundingBox->GetScaledBoxExtent().Y;
-	int NumberOfPoints = ((2 * width) / Resolution) * ((2 * depth) / Resolution);
+	
+	int WidthInCells = FMath::FloorToInt((2 * width) / Resolution);
+	int DepthInCells = FMath::FloorToInt((2 * depth) / Resolution);
+
+	int NumberOfPoints = WidthInCells * DepthInCells;
 
 	//Pre-allocate that many points in the array
 	TArray<FVector> FlowMap;
@@ -132,11 +147,27 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 	TArray<float> FlowMapWeights;
 	FlowMapWeights.Init(FLT_MAX, NumberOfPoints);
 
+	auto GetNeighborIndeces = [&](int Index) -> TArray<int32, TInlineAllocator<4>>
+		{
+			TArray<int32, TInlineAllocator<4>> Indeces;
+			Indeces.Init(Index, 4);
+			if ((Index - 1 >= 0) && ((Index) % WidthInCells != 0)) Indeces[0] = (Index - 1);
+			if ((Index + 1 < NumberOfPoints) && ((Index + 1) % WidthInCells != 0)) Indeces[1] = (Index + 1);
+			if (Index - WidthInCells > 0) Indeces[2] = (Index - WidthInCells);
+			if (Index + WidthInCells < NumberOfPoints) Indeces[3] = (Index + WidthInCells);
+			return Indeces;
+		};
+
+	//takes an index in the array and gets its coordinates in local space
+	auto GetIndexRelativeCoordinates = [&](int Index) -> FVector2D
+		{
+			return FVector2D{ (Index % WidthInCells) * Resolution, (Index / WidthInCells) * Resolution };
+		};
+
 	//Generate flowmap weights
 	if (FMath::IsWithinInclusive(Target->GetActorLocation().X, width * -1, width) && FMath::IsWithinInclusive(Target->GetActorLocation().Y, depth * -1, depth))
 	{
 		//Find the cell the target (player) is in
-		
 		FlowMapOrigin = { GetActorLocation().X - width, GetActorLocation().Y - depth, GetActorLocation().Z };
 
 		int TargetCellXCoord;
@@ -148,30 +179,11 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 		TargetCellXCoord = TargetLocationRelativeToFlowMap.X / Resolution;
 		TargetCellYCoord = TargetLocationRelativeToFlowMap.Y / Resolution;
 
-		int WidthInCells = (2 * width) / Resolution;
-		int DepthInCells = (2 * depth) / Resolution;
-
 		//Pre-allocate the heightmap array
-		PlayerFlowmapFloorHeight.SetNum(WidthInCells * DepthInCells + 1);
+		PlayerFlowmapFloorHeight.SetNum(NumberOfPoints);
 
 		//Convert those coordinates into an array index
 		TargetCellIndex = (TargetCellXCoord) + (TargetCellYCoord * WidthInCells);
-
-		//Helper function, returns the indeces of the orthogonal neigbors of a cell
-		auto GetNeighborIndeces = [&](int Index) -> TArray<float>
-		{
-			TArray<float> Indeces;
-			Indeces.Init(Index, 4);
-			if ((Index - 1 >= 0) && ((Index) % WidthInCells != 0))
-				Indeces[0] = (Index - 1);
-			if ((Index + 1 < NumberOfPoints) && ((Index + 1) % WidthInCells != 0))
-				Indeces[1] = (Index + 1);
-			if (Index - WidthInCells > 0)
-				Indeces[2] = (Index - WidthInCells);
-			if (Index + WidthInCells < NumberOfPoints)
-				Indeces[3] = (Index + WidthInCells);
-			return Indeces;
-		};
 
 		//Add flowmap weights to the queue
 
@@ -196,6 +208,9 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 			}
 		}
 
+		TArray<float> BlurOutputArray;
+		BlurOutputArray.SetNum(NumberOfPoints);
+
 		//Gaussian blur function, helps smooth out the flowmap so we don't have only orthogonal and diagonal directions
 		auto GaussianBlur = [&](TArray<float>* FlowMap) -> void
 			{
@@ -219,10 +234,10 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 					}
 					float average = sum / count;
 
-					OutputArray[i] = average;
+					BlurOutputArray[i] = average;
 				}
 
-				*FlowMap = OutputArray;
+				*FlowMap = BlurOutputArray;
 			};
 
 		//Run the gaussian blur a few times. Tweak this to change flowmap smoothness, higher values impact performance
@@ -234,7 +249,7 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 		//Generate flowmap vectors from flowmap weights
 		for (int32 CurrentCellIndex = 0; CurrentCellIndex < FlowMapWeights.Num(); CurrentCellIndex++)
 		{
-			//Again, using MAX_32 as a placeholder
+			//Again, using MAX_int32 as a placeholder
 			if (FlowMapWeights[CurrentCellIndex] == MAX_int32) continue;
 
 			if (FlowMapWeights[CurrentCellIndex] == 0)
@@ -248,33 +263,29 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 			float OutputHorizontal;
 			float OutputVertical;
 
-			//Get the X and Y components of our vector, with edge-case handling
-			if (FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[0]] == FlowMapWeights[CurrentCellIndex] || FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[1]] == FlowMapWeights[CurrentCellIndex])
-				OutputHorizontal = 2 * (FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[0]] - FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[1]]);
-			else
-				OutputHorizontal = (FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[0]] - FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[1]]);
+			auto Neighbors = GetNeighborIndeces(CurrentCellIndex);
 
-			if (FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[2]] == FlowMapWeights[CurrentCellIndex] || FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[3]] == FlowMapWeights[CurrentCellIndex])
-				OutputVertical = 2 * (FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[2]] - FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[3]]);
+			//Get the X and Y components of our vector, with edge-case handling
+			if (FlowMapWeights[Neighbors[0]] == FlowMapWeights[CurrentCellIndex] || FlowMapWeights[Neighbors[1]] == FlowMapWeights[CurrentCellIndex])
+				OutputHorizontal = 2 * (FlowMapWeights[Neighbors[0]] - FlowMapWeights[Neighbors[1]]);
 			else
-				OutputVertical = (FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[2]] - FlowMapWeights[GetNeighborIndeces(CurrentCellIndex)[3]]);
+				OutputHorizontal = (FlowMapWeights[Neighbors[0]] - FlowMapWeights[Neighbors[1]]);
+
+			if (FlowMapWeights[Neighbors[2]] == FlowMapWeights[CurrentCellIndex] || FlowMapWeights[Neighbors[3]] == FlowMapWeights[CurrentCellIndex])
+				OutputVertical = 2 * (FlowMapWeights[Neighbors[2]] - FlowMapWeights[Neighbors[3]]);
+			else
+				OutputVertical = (FlowMapWeights[Neighbors[2]] - FlowMapWeights[Neighbors[3]]);
 
 			//Get our vector from those components
 			OutputVector = (FVector2D{OutputHorizontal, OutputVertical}.GetSafeNormal());
 
-			//Converts an array index back into local-space coordinates
-			auto GetIndexRelativeCoordinates = [&](int Index) -> FVector2D
-				{
-					FVector2D OutputVector = { (Index % WidthInCells) * Resolution, (Index / WidthInCells) * Resolution };
-					return OutputVector;
-				};
+			FCollisionQueryParams QueryParams;
+			QueryParams.AddIgnoredActor(Target);
 
-			//Find the height at this flowmap index
-			FVector IndexRelativeFloorLocation = LineTraceWithinVolume(GetIndexRelativeCoordinates(CurrentCellIndex) + FVector2D{ FlowMapOrigin }, ECC_WorldStatic, FCollisionQueryParams()).Location;
+			FVector IndexRelativeFloorLocation = LineTraceWithinVolume(GetIndexRelativeCoordinates(CurrentCellIndex) + FVector2D{ FlowMapOrigin }, ECC_WorldStatic, QueryParams).Location;
 			PlayerFlowmapFloorHeight[CurrentCellIndex] = IndexRelativeFloorLocation.Z;
 
 			// Draw Debug
-
 			if (DrawDebug)
 			{
 
@@ -282,18 +293,17 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 
 				FBoxSphereBounds ComponentBounds = BoundingBox->Bounds;
 				float MaxHeight = ComponentBounds.Origin.Z + ComponentBounds.BoxExtent.Z;
-
 				
 				FVector StartLocation = (FVector{ GetIndexRelativeCoordinates(CurrentCellIndex), MaxHeight } + FVector{FlowMapOrigin.X, FlowMapOrigin.Y, 0});
 				FVector EndLocation = StartLocation - FVector{ 0, 0, ComponentBounds.BoxExtent.Z * 2 };
-				FCollisionQueryParams QueryParams;
+				FCollisionQueryParams DebugQueryParams;
 
 				GetWorld()->LineTraceSingleByChannel(
 					HitResult,
 					StartLocation,
 					EndLocation,
 					ECC_WorldStatic,
-					QueryParams
+					DebugQueryParams
 				);
 
 				/*
@@ -323,9 +333,7 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 					0.2f,
 					0,
 					5.0f
-				);
-
-				
+				);				
 			}
 
 			//Finally, set the flowmap value at index
@@ -339,7 +347,6 @@ void ASwarmManager::GenerateFlowMap(AActor* Target, TArray<FVector>* Array)
 void ASwarmManager::UpdateFlowMaps()
 {
 	GenerateFlowMap(UGameplayStatics::GetPlayerCharacter(GetWorld(), 0), &PlayerFlowmap);
-	//GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow, TEXT("Hello World! I'm Properly Debugging"));
 }
 
 void ASwarmManager::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
@@ -351,118 +358,156 @@ void ASwarmManager::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* 
 	}
 }
 
+//The main function that moves the units every tick
 void ASwarmManager::MoveUnits(float DeltaTime)
 {
+	DeltaTime = FMath::Min(DeltaTime, 0.05f); //Clamp delta-time to prevent window out-of-focus number explosions
+
 	if (PlayerFlowmap.Num() == 0) return;
 
 	int InstanceCount = EnemyInstancedMesh->GetInstanceCount();
-	TArray<FTransform> ArrayOfTransforms;
+
+	//Static arrays save performance
+	static TArray<FTransform> ArrayOfTransforms;
 	ArrayOfTransforms.SetNumUninitialized(InstanceCount);
 
-	// Reset buckets
+	static TArray<int32> RatCellIDs;
+	RatCellIDs.SetNumUninitialized(InstanceCount);
+
+	// Reset collision groups
 	RatCollisionGroups.SetNum(PlayerFlowmap.Num());
 	for (int b = 0; b < RatCollisionGroups.Num(); b++)
 	{
-		RatCollisionGroups[b].Reset();
+		RatCollisionGroups[b].Reset(); //Reset instead of empty to save performance
 	}
 
-	//Loop through all rats, putting them in a "collision group" with other rats close to their index
+	//Calculate the reciporocal to avoid division in loops
+	float InvResolution = 1.0f / Resolution;
+	int32 WidthInCells = FMath::FloorToInt((width * 2.0f) * InvResolution);
+
+	int32 FlowmapCount = PlayerFlowmap.Num(); //Cache the loop limit just in case to save performance
+
 	for (int i = 0; i < InstanceCount; i++)
 	{
-		int ThisRatsArrayID = GetFlowmapIndexAtWorldLocation(RatData[i].Location);
-		if (ThisRatsArrayID != -1)
+		//Manual inline of GetFlowmapIndex to avoid function call overhead
+		FVector RelativeLoc = RatData[i].Location - FlowMapOrigin;
+		int32 XIndex = FMath::FloorToInt(RelativeLoc.X * InvResolution);
+		int32 YIndex = FMath::FloorToInt(RelativeLoc.Y * InvResolution);
+		int32 RoundedIndex = XIndex + (YIndex * WidthInCells);
+
+		//Add this rat to its appropriate collision group
+		if (RoundedIndex >= 0 && RoundedIndex < FlowmapCount)
 		{
-			RatCollisionGroups[ThisRatsArrayID].Add(i);
+			RatCellIDs[i] = RoundedIndex;
+			RatCollisionGroups[RoundedIndex].Add(i);
+		}
+		else
+		{
+			RatCellIDs[i] = -1;
 		}
 	}
 
-	FVector BaseMeshBounds = EnemyInstancedMesh->GetStaticMesh()->GetBounds().BoxExtent;
-	float CollisionRadius = BaseMeshBounds.GetMin();
-	float SeparationRadius = CollisionRadius * 10.0f; // Distance where separation kicks in
-	float MoveSpeed = 500.0f; // Base movement speed in cm/s
+	//Steering/Collision controls
+	float SeparationRadius = EnemyInstancedMesh->GetStaticMesh()->GetBounds().BoxExtent.GetMin() * 15.0f;
+	float SeparationRadiusSq = SeparationRadius * SeparationRadius;
+	float MoveSpeed = 500.0f;
+	float MaxSpeedSq = (MoveSpeed * 2.5f) * (MoveSpeed * 2.5f);
+	float SepMultiplier = MoveSpeed * 5.0f;
+	float InterpAlpha = FMath::Clamp(DeltaTime * 15.0f, 0.0f, 1.0f);
+	float GravityStep = 980.0f * DeltaTime;
 
-	//Calculate Steering & Movement
-	for (int i = 0; i < InstanceCount; i++)
+	// Calculate Steering & Movement
+	for (int32 i = 0; i < InstanceCount; i++)
 	{
-		int ThisRatsArrayID = GetFlowmapIndexAtWorldLocation(RatData[i].Location);
+		int ThisRatsArrayID = RatCellIDs[i];
 		FVector CurrentLocation = RatData[i].Location;
-
-		//FLOWMAP FORCE (Desire to reach player)
-		FVector FlowDirection = (ThisRatsArrayID != -1) ? PlayerFlowmap[ThisRatsArrayID] : FVector::ZeroVector;
-		FVector FlowVelocity = FlowDirection * MoveSpeed;
-
-		//SEPARATION FORCE (Desire to stay away from neighbors)
-		FVector SeparationForce = FVector::ZeroVector;
+		FVector Velocity = RatData[i].Velocity;
+		FVector TargetVelocity = FVector::ZeroVector;
 
 		if (ThisRatsArrayID != -1)
 		{
-			//Find all other rats in this rat's collision group
-			for (int c = 0; c < RatCollisionGroups[ThisRatsArrayID].Num(); c++)
+			TargetVelocity = PlayerFlowmap[ThisRatsArrayID] * MoveSpeed;
+
+			const TArray<int32>& Group = RatCollisionGroups[ThisRatsArrayID];
+			int GroupSize = Group.Num();
+
+			if (GroupSize > 1) //Check against neighbors
 			{
-				int OtherRatID = RatCollisionGroups[ThisRatsArrayID][c];
-				if (OtherRatID != i)
+				int CheckedNeighbors = 0;
+				int Step = FMath::Max(1, GroupSize / 8); //Step helps us check a good sample size of rats without checking every one, in case many are crammed in one cell
+				float SepForceX = 0.0f;
+				float SepForceY = 0.0f;
+
+				for (int c = 0; c < GroupSize; c += Step)
 				{
-					//Work strictly in 2D (ignore Z height for separation)
-					FVector MyLoc2D = FVector(CurrentLocation.X, CurrentLocation.Y, 0.0f);
-					FVector OtherLoc2D = FVector(RatData[OtherRatID].Location.X, RatData[OtherRatID].Location.Y, 0.0f);
+					if (CheckedNeighbors >= 6) break;
 
-					float Dist = FVector::Dist(MyLoc2D, OtherLoc2D);
-
-					if (Dist < SeparationRadius && Dist > 0.1f)
+					int OtherRatID = Group[c];
+					if (OtherRatID != i)
 					{
-						FVector PushDir = (MyLoc2D - OtherLoc2D).GetSafeNormal();
+						//Calculate 2D distance manually (bypasses FVector overhead)
+						float dX = CurrentLocation.X - RatData[OtherRatID].Location.X;
+						float dY = CurrentLocation.Y - RatData[OtherRatID].Location.Y;
+						float DistSq = (dX * dX) + (dY * dY);
 
-						//Inverse weighting: The closer they are, the exponentially stronger the push force
-						float Strength = (SeparationRadius - Dist) / SeparationRadius;
-						SeparationForce += (PushDir * Strength * MoveSpeed * 3);
+						//Seperation force math
+						if (DistSq < SeparationRadiusSq && DistSq > 1.0f)
+						{
+							float InvDist = FMath::InvSqrt(DistSq);
+							float ActualDist = DistSq * InvDist;
+							float ForceMag = ((SeparationRadius - ActualDist) / SeparationRadius) * SepMultiplier * InvDist;
+
+							SepForceX += dX * ForceMag;
+							SepForceY += dY * ForceMag;
+						}
+						CheckedNeighbors++;
 					}
 				}
+				TargetVelocity.X += SepForceX;
+				TargetVelocity.Y += SepForceY;
 			}
 		}
 
-		//COMBINE FORCES (Flow Vector + Separation Vector)
-		FVector TargetVelocity = FlowVelocity + SeparationForce;
-
-		//Clamp max speed so separation forces don't launch rats across the map
-		TargetVelocity = TargetVelocity.GetClampedToMaxSize(MoveSpeed * 1.5f);
-
-		//Keep vertical gravity intact
-		float FloorHeight = (ThisRatsArrayID != -1) ? PlayerFlowmapFloorHeight[ThisRatsArrayID] : 0.0f;
-		float NewVelocityZ = (CurrentLocation.Z >= FloorHeight) ? (RatData[i].Velocity.Z - (980.0f * DeltaTime)) : 0.0f;
-
-		//SMOOTH INTERPOLATION (VInterpTo eliminates all jitter!)
-		//InterpSpeed (15.0f) controls responsiveness. Higher = tighter, Lower = smoother/heavier
-		FVector SmoothedXYVelocity = FMath::VInterpTo(
-			FVector(RatData[i].Velocity.X, RatData[i].Velocity.Y, 0.0f),
-			FVector(TargetVelocity.X, TargetVelocity.Y, 0.0f),
-			DeltaTime,
-			15.0f
-		);
-
-		//Apply final smoothed velocity
-		RatData[i].Velocity.X = SmoothedXYVelocity.X;
-		RatData[i].Velocity.Y = SmoothedXYVelocity.Y;
-		RatData[i].Velocity.Z = NewVelocityZ;
-
-		//INTEGRATE POSITION (Location += Velocity * DeltaTime)
-		FVector NewLocation = CurrentLocation + (RatData[i].Velocity * DeltaTime);
-
-		//Snap to floor if below terrain
-		if (NewLocation.Z < FloorHeight)
+		//Fast Clamp
+		float TargetVelSq = (TargetVelocity.X * TargetVelocity.X) + (TargetVelocity.Y * TargetVelocity.Y);
+		if (TargetVelSq > MaxSpeedSq)
 		{
-			NewLocation.Z = FloorHeight;
-			RatData[i].Velocity.Z = 0.0f;
+			float InvVel = FMath::InvSqrt(TargetVelSq);
+			TargetVelocity.X *= (MoveSpeed * 1.5f) * InvVel;
+			TargetVelocity.Y *= (MoveSpeed * 1.5f) * InvVel;
 		}
 
-		//Save Location
-		RatData[i].Location = NewLocation;
+		float FloorHeight = (ThisRatsArrayID != -1) ? PlayerFlowmapFloorHeight[ThisRatsArrayID] : 0.0f;
 
-		//Update GPU Instance Transform
-		//Set rotation to match movement direction for smooth turning
-		FRotator TargetRotation = RatData[i].Velocity.IsNearlyZero() ? FRotator::ZeroRotator : RatData[i].Velocity.Rotation();
-		ArrayOfTransforms[i] = FTransform(TargetRotation, NewLocation, FVector::OneVector);
+		//Manual Lerp to completely bypass VInterpTo overhead
+		Velocity.X += (TargetVelocity.X - Velocity.X) * InterpAlpha;
+		Velocity.Y += (TargetVelocity.Y - Velocity.Y) * InterpAlpha;
+		Velocity.Z = (CurrentLocation.Z >= FloorHeight) ? (Velocity.Z - GravityStep) : 0.0f;
+
+		CurrentLocation.X += Velocity.X * DeltaTime;
+		CurrentLocation.Y += Velocity.Y * DeltaTime;
+		CurrentLocation.Z += Velocity.Z * DeltaTime;
+
+		//Snap to floor height if we end below it
+		if (CurrentLocation.Z < FloorHeight)
+		{
+			CurrentLocation.Z = FloorHeight;
+			Velocity.Z = 0.0f;
+		}
+
+		RatData[i].Velocity = Velocity;
+		RatData[i].Location = CurrentLocation;
+
+		//Rotation math
+		float Yaw = 0.0f;
+		if (TargetVelSq > 1.0f)
+		{
+			Yaw = FMath::RadiansToDegrees(FMath::Atan2(Velocity.Y, Velocity.X) - 90);
+		}
+
+		ArrayOfTransforms[i] = FTransform(FRotator(0.0f, Yaw, 0.0f), CurrentLocation, FVector::OneVector);
 	}
 
-	//Ship to GPU
-	EnemyInstancedMesh->BatchUpdateInstancesTransforms(0, ArrayOfTransforms, true, true);
+	//Ship rat positions to GPU
+	EnemyInstancedMesh->BatchUpdateInstancesTransforms(0, ArrayOfTransforms, true, false, true);
 }
