@@ -99,6 +99,8 @@ protected:
 	int width;
 	int depth;
 
+	int32 RenderToggleFrame = 0;
+
 public:	
 	// Called every frame
 	virtual void Tick(float DeltaTime) override;
